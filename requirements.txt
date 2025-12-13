@@ -1,0 +1,5 @@
+aiohttp
+aiogram==3.22.0
+aiosqlite
+loguru
+python-dotenv
