@@ -9,17 +9,29 @@ from loguru import logger
 import aiohttp
 from dotenv import load_dotenv
 import aiosqlite
-from aiogram import Bot
+from aiogram import Bot, Dispatcher, Router
+from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.types import BufferedInputFile
+from aiogram import types
 
 logger.remove()
 logger.add(
     sys.stdout,
     format="| <magenta>{time:YYYY-MM-DD HH:mm:ss}</magenta> | <cyan><level>{level: <8}</level></cyan> | {message}",
     level="INFO",
+    colorize=True,
 )
+logger.add(
+    "bot.log",
+    format="| {time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
+    level="SUCCESS",
+    rotation="10 MB",
+    retention="7 days",
+    compression="zip",
+)
+
 
 
 def _build_headers() -> Dict[str, str]:
@@ -313,6 +325,16 @@ async def init_db(conn: aiosqlite.Connection) -> None:
     )
     await conn.commit()
 
+async def ensure_threshold_column(conn: aiosqlite.Connection) -> None:
+    async with conn.execute("PRAGMA table_info(floors)") as cur:
+        cols = await cur.fetchall()
+        names = [c[1] for c in cols]
+        if "threshold_percent" not in names:
+            await conn.execute("ALTER TABLE floors ADD COLUMN threshold_percent REAL")
+            await conn.commit()
+    await conn.execute("UPDATE floors SET threshold_percent = COALESCE(threshold_percent, 50)")
+    await conn.commit()
+
 async def get_floor(conn: aiosqlite.Connection, rarity: str) -> Optional[float]:
     async with conn.execute("SELECT price FROM floors WHERE rarity = ?", (rarity,)) as cur:
         row = await cur.fetchone()
@@ -348,6 +370,23 @@ async def set_notified(conn: aiosqlite.Connection, item_id: str, price: float) -
     await conn.execute(
         "INSERT INTO notifications(item_id, last_price, last_at) VALUES(?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET last_price=excluded.last_price, last_at=excluded.last_at",
         (item_id, round(price, 2), ts),
+    )
+    await conn.commit()
+
+async def get_threshold(conn: aiosqlite.Connection, rarity: str) -> float:
+    async with conn.execute("SELECT threshold_percent FROM floors WHERE rarity = ?", (rarity,)) as cur:
+        row = await cur.fetchone()
+        if not row or row[0] is None:
+            return 50.0
+        try:
+            return float(row[0])
+        except Exception:
+            return 50.0
+
+async def set_threshold(conn: aiosqlite.Connection, rarity: str, percent: float) -> None:
+    await conn.execute(
+        "INSERT INTO floors(rarity, price, updated_at, threshold_percent) VALUES(?, ?, ?, ?) ON CONFLICT(rarity) DO UPDATE SET threshold_percent=excluded.threshold_percent",
+        (rarity, None, "", percent),
     )
     await conn.commit()
 
@@ -395,11 +434,17 @@ def _format_caption(token_id: Optional[str], rarity: Optional[str], price: Optio
 
 async def run() -> None:
     collection_hyphen = "POLYGON-0xd8156606d2bf60c12d55f561395d29ba3c5ccc63"
-    opensea_collection_hyphen = "0xd8156606d2bf60c12d55f561395d29ba3c5ccc63"
+
     load_dotenv()
     marketplace_base = "https://og.rarible.com/marketplace/api/v4"
     bot_token = os.getenv("BOT_TOKEN")
     channel_id = os.getenv("CHANNEL_ID")
+    channel_id_int: Optional[int] = None
+    try:
+        if channel_id and channel_id.startswith("-"):
+            channel_id_int = int(channel_id)
+    except Exception:
+        channel_id_int = None
 
     timeout = aiohttp.ClientTimeout(total=30)
     connector = aiohttp.TCPConnector(limit=16, enable_cleanup_closed=True)
@@ -409,7 +454,97 @@ async def run() -> None:
             bot = Bot(token=bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         conn = await aiosqlite.connect("floors.db")
         await init_db(conn)
+        await ensure_threshold_column(conn)
         rarities = ["Legendary", "Epic", "Rare", "Uncommon", "Common"]
+        dp: Optional[Dispatcher] = None
+        router: Optional[Router] = None
+        if bot:
+            dp = Dispatcher()
+            router = Router()
+            async def _handle_set(msg: types.Message) -> None:
+                if not msg.text:
+                    return
+                txt = msg.text.strip()
+                chat_ok = True
+                if channel_id and channel_id.startswith("@") and msg.chat and msg.chat.username and ("@" + msg.chat.username) == channel_id:
+                    chat_ok = True
+                if channel_id_int is not None and msg.chat and msg.chat.id == channel_id_int:
+                    chat_ok = True
+                if not chat_ok:
+                    if bot:
+                        await bot.send_message(chat_id=msg.chat.id, text="Command is only available in the specified channel")
+                    return
+                try:
+                    payload = txt[4:].strip()
+                    if not payload:
+                        await bot.send_message(chat_id=msg.chat.id, text="Use the format: /set Rarity, Percent")
+                        return
+                    parts = [p.strip() for p in payload.split(",") if p.strip()]
+                    if len(parts) != 2:
+                        parts = [p for p in payload.split() if p]
+                    if len(parts) != 2:
+                        await bot.send_message(chat_id=msg.chat.id, text="Use the format: /set Rarity, Percent")
+                        return
+                    rarity_in = parts[0].lower()
+                    percent_in = parts[1]
+                    mapping = {r.lower(): r for r in rarities}
+                    rarity_norm = mapping.get(rarity_in)
+                    if not rarity_norm:
+                        await bot.send_message(chat_id=msg.chat.id, text="Rarity must be one of: Legendary, Epic, Rare, Uncommon, Common")
+                        return
+                    try:
+                        percent_val = float(percent_in)
+                    except Exception:
+                        await bot.send_message(chat_id=msg.chat.id, text="Percent must be a number between 1 and 100")
+                        return
+                    if not (0 < percent_val <= 100):
+                        await bot.send_message(chat_id=msg.chat.id, text="Percent must be a number between 1 and 100")
+                        return
+                    await set_threshold(conn, rarity_norm, percent_val)
+                    await bot.send_message(chat_id=msg.chat.id, text=f"Threshold updated for {rarity_norm}: {round(percent_val, 2):.2f}%")
+                except Exception:
+                    logger.info("Set command error")
+                    if bot:
+                        await bot.send_message(chat_id=msg.chat.id, text="Use the format: /set Rarity, Percent")
+            router.message.register(_handle_set, Command("set"))
+            router.channel_post.register(_handle_set, Command("set"))
+            async def _handle_current(msg: types.Message) -> None:
+                if not msg.text:
+                    return
+                logger.info("Received /current request")
+                chat_ok = True
+                if channel_id and channel_id.startswith("@") and msg.chat and msg.chat.username and ("@" + msg.chat.username) == channel_id:
+                    chat_ok = True
+                if channel_id_int is not None and msg.chat and msg.chat.id == channel_id_int:
+                    chat_ok = True
+                if not chat_ok:
+                    if bot:
+                        await bot.send_message(chat_id=msg.chat.id, text="Command is only available in the specified channel")
+                    return
+                try:
+                    emojis = {
+                        "Legendary": "🟨",
+                        "Epic": "🟪",
+                        "Rare": "🟦",
+                        "Uncommon": "🟩",
+                        "Common": "⬜️",
+                    }
+                    lines = []
+                    for rname in rarities:
+                        thv = await get_threshold(conn, rname)
+                        em = emojis.get(rname, "")
+                        lines.append(f"{em} {rname} -> {round(thv, 2):.2f}%")
+                    text = "\n".join(lines)
+                    await bot.send_message(chat_id=msg.chat.id, text=text)
+                    logger.info("Current thresholds sent")
+                except Exception:
+                    logger.info("Failed to fetch current thresholds")
+                    if bot:
+                        await bot.send_message(chat_id=msg.chat.id, text="Failed to fetch current thresholds")
+            router.message.register(_handle_current, Command("current"))
+            router.channel_post.register(_handle_current, Command("current"))
+            dp.include_router(router)
+            asyncio.create_task(dp.start_polling(bot))
 
         async def _enrich(it: Dict[str, Any], rate: Optional[float]) -> Dict[str, Any]:
             image_url = await extract_image_url(it)
@@ -421,7 +556,7 @@ async def run() -> None:
             token_id = it.get("tokenId")
             item_id = it.get("id")
             rarible_url = f"https://og.rarible.com/token/{item_id}" if isinstance(item_id, str) else None
-            opensea_url = f"https://opensea.io/item/polygon/{opensea_collection_hyphen}/{token_id}" if isinstance(token_id, str) else None
+            opensea_url = f"https://opensea.io/item/pol/{collection_hyphen}/{token_id}" if isinstance(token_id, str) else None
             rarity = extract_rarity(it, meta_extracted.get("rarity"))
             price_val = _parse_price(price)
             price_usd: Optional[float] = None
@@ -462,12 +597,13 @@ async def run() -> None:
                 price_usd = r.get("price_usd")
                 price_str = f"{price_usd:.2f} USD" if isinstance(price_usd, float) else r.get("price")
                 floor_price = await get_floor(conn, rarity) if isinstance(rarity, str) else None
+                th = await get_threshold(conn, rarity) if isinstance(rarity, str) else 50.0
                 if isinstance(price_usd, float) and isinstance(floor_price, float):
                     price_cmp = round(price_usd, 2)
-                    half_cmp = round(floor_price * 0.5, 2)
-                    logger.info(f"Compare: rarity {rarity} price {price_cmp:.2f} <= half {half_cmp:.2f}")
-                if price_usd is not None and floor_price is not None and round(price_usd, 2) <= round(floor_price * 0.5, 2):
-                    logger.info(f"Trigger: rarity {rarity} price_usd {round(price_usd, 2):.2f} floor {round(floor_price, 2):.2f}")
+                    limit_cmp = round(floor_price * (1 - th / 100.0), 2)
+                    logger.info(f"Compare: rarity {rarity} price {price_cmp:.2f} <= limit {limit_cmp:.2f} ({round(th,2):.2f}%)")
+                if price_usd is not None and floor_price is not None and round(price_usd, 2) <= round(floor_price * (1 - th / 100.0), 2):
+                    logger.info(f"Trigger: rarity {rarity} price_usd {round(price_usd, 2):.2f} floor {round(floor_price, 2):.2f} ({round(th,2):.2f}%)")
                     last_notified_price = None
                     if isinstance(r.get("item_id"), str):
                         last_notified_price = await get_notified(conn, r.get("item_id"))
@@ -505,8 +641,8 @@ async def run() -> None:
                                 logger.info(f"Floor updated immediately for {rarity}: {round(price_usd, 2):.2f} USD")
                             if isinstance(r.get("item_id"), str) and isinstance(price_usd, float):
                                 await set_notified(conn, r.get("item_id"), price_usd)
-                        except Exception as e:
-                            logger.exception(f"Telegram send error: {e}")
+                        except Exception:
+                            logger.info("Telegram send failed")
                 if tick == 1 and price_usd is not None and isinstance(rarity, str):
                     await set_floor(conn, rarity, price_usd)
                     logger.info(f"Floor initialized for {rarity}: {round(price_usd, 2):.2f} USD")
