@@ -434,6 +434,7 @@ def _format_caption(token_id: Optional[str], rarity: Optional[str], price: Optio
 
 async def run() -> None:
     collection_hyphen = "POLYGON-0xd8156606d2bf60c12d55f561395d29ba3c5ccc63"
+    opensea_collection_hyphen = "0xd8156606d2bf60c12d55f561395d29ba3c5ccc63"
 
     load_dotenv()
     marketplace_base = "https://og.rarible.com/marketplace/api/v4"
@@ -556,7 +557,7 @@ async def run() -> None:
             token_id = it.get("tokenId")
             item_id = it.get("id")
             rarible_url = f"https://og.rarible.com/token/{item_id}" if isinstance(item_id, str) else None
-            opensea_url = f"https://opensea.io/item/pol/{collection_hyphen}/{token_id}" if isinstance(token_id, str) else None
+            opensea_url = f"https://opensea.io/item/polygon/{opensea_collection_hyphen}/{token_id}" if isinstance(token_id, str) else None
             rarity = extract_rarity(it, meta_extracted.get("rarity"))
             price_val = _parse_price(price)
             price_usd: Optional[float] = None
