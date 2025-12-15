@@ -35,30 +35,32 @@ logger.add(
 
 
 def _build_headers() -> Dict[str, str]:
-    return {"Accept": "application/json"}
+    return {
+        "Accept": "application/json",
+        "User-Agent": "WinkWatcher/1.0 (+https://og.rarible.com)",
+    }
 
 
 async def fetch_json(
     session: aiohttp.ClientSession, url: str, params: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             async with session.get(url, params=params, headers=_build_headers()) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                text = await resp.text()
-                logger.warning(f"Non-200 response {resp.status} for {url}: {text}")
+                logger.info(f"Non-200 response {resp.status} for {url}")
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning(f"Request error on attempt {attempt + 1} for {url}: {e}")
-        await asyncio.sleep(1.0 * (attempt + 1))
+            logger.info(f"Request error on attempt {attempt + 1} for {url}: {e}")
+        await asyncio.sleep(1.5 * (attempt + 1))
     return {}
 
 async def post_json(
     session: aiohttp.ClientSession, url: str, payload: Dict[str, Any]
 ) -> Any:
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             async with session.post(
                 url,
@@ -72,13 +74,12 @@ async def post_json(
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                text = await resp.text()
-                logger.warning(f"Non-200 response {resp.status} for {url}: {text}")
+                logger.info(f"Non-200 response {resp.status} for {url}")
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning(f"Request error on attempt {attempt + 1} for {url}: {e}")
-        await asyncio.sleep(1.0 * (attempt + 1))
+            logger.info(f"Request error on attempt {attempt + 1} for {url}: {e}")
+        await asyncio.sleep(1.5 * (attempt + 1))
     return {}
 
 async def extract_image_url(item: Dict[str, Any]) -> Optional[str]:
@@ -434,7 +435,6 @@ def _format_caption(token_id: Optional[str], rarity: Optional[str], price: Optio
 
 async def run() -> None:
     collection_hyphen = "POLYGON-0xd8156606d2bf60c12d55f561395d29ba3c5ccc63"
-    opensea_collection_hyphen = "0xd8156606d2bf60c12d55f561395d29ba3c5ccc63"
 
     load_dotenv()
     marketplace_base = "https://og.rarible.com/marketplace/api/v4"
@@ -524,10 +524,10 @@ async def run() -> None:
                     return
                 try:
                     emojis = {
-                        "Legendary": "🟨",
-                        "Epic": "🟪",
-                        "Rare": "🟦",
-                        "Uncommon": "🟩",
+                        "Legendary": "🟪",
+                        "Epic": "🟥",
+                        "Rare": "🟨",
+                        "Uncommon": "🟦",
                         "Common": "⬜️",
                     }
                     lines = []
@@ -546,6 +546,7 @@ async def run() -> None:
             router.channel_post.register(_handle_current, Command("current"))
             dp.include_router(router)
             asyncio.create_task(dp.start_polling(bot))
+        prev_items: Dict[str, List[Dict[str, Any]]] = {r: [] for r in rarities}
 
         async def _enrich(it: Dict[str, Any], rate: Optional[float]) -> Dict[str, Any]:
             image_url = await extract_image_url(it)
@@ -557,7 +558,7 @@ async def run() -> None:
             token_id = it.get("tokenId")
             item_id = it.get("id")
             rarible_url = f"https://og.rarible.com/token/{item_id}" if isinstance(item_id, str) else None
-            opensea_url = f"https://opensea.io/item/polygon/{opensea_collection_hyphen}/{token_id}" if isinstance(token_id, str) else None
+            opensea_url = f"https://opensea.io/item/pol/{collection_hyphen}/{token_id}" if isinstance(token_id, str) else None
             rarity = extract_rarity(it, meta_extracted.get("rarity"))
             price_val = _parse_price(price)
             price_usd: Optional[float] = None
@@ -589,10 +590,14 @@ async def run() -> None:
             logger.info("Fetching cheapest items per rarity")
             per_rarity: List[List[Dict[str, Any]]] = await asyncio.gather(*tasks)
             items: List[Dict[str, Any]] = []
-            for lst in per_rarity:
-                items.extend(lst)
+            for i, lst in enumerate(per_rarity):
+                rname = rarities[i]
+                use_list = lst if lst else prev_items.get(rname, [])
+                prev_items[rname] = use_list
+                items.extend(use_list)
             logger.info(f"Items fetched: {len(items)}")
             results: List[Dict[str, Any]] = await asyncio.gather(*[ _enrich(it, rate) for it in items ])
+            notified_rarities: set = set()
             for r in results:
                 rarity = r.get("rarity")
                 price_usd = r.get("price_usd")
@@ -640,16 +645,24 @@ async def run() -> None:
                             if isinstance(rarity, str) and isinstance(price_usd, float):
                                 await set_floor(conn, rarity, price_usd)
                                 logger.info(f"Floor updated immediately for {rarity}: {round(price_usd, 2):.2f} USD")
+                                notified_rarities.add(rarity)
                             if isinstance(r.get("item_id"), str) and isinstance(price_usd, float):
                                 await set_notified(conn, r.get("item_id"), price_usd)
                         except Exception:
                             logger.info("Telegram send failed")
                 if tick == 1 and price_usd is not None and isinstance(rarity, str):
-                    await set_floor(conn, rarity, price_usd)
-                    logger.info(f"Floor initialized for {rarity}: {round(price_usd, 2):.2f} USD")
+                    current_floor = await get_floor(conn, rarity)
+                    if current_floor is None:
+                        await set_floor(conn, rarity, price_usd)
+                        logger.info(f"Floor initialized for {rarity}: {round(price_usd, 2):.2f} USD")
                 if price_usd is not None and tick % 3 == 0 and isinstance(rarity, str):
-                    await set_floor(conn, rarity, price_usd)
-                    logger.info(f"Floor updated for {rarity}: {round(price_usd, 2):.2f} USD")
+                    current_floor = await get_floor(conn, rarity)
+                    if current_floor is None:
+                        await set_floor(conn, rarity, price_usd)
+                        logger.info(f"Floor updated for {rarity}: {round(price_usd, 2):.2f} USD")
+                    elif rarity not in notified_rarities and price_usd >= current_floor:
+                        await set_floor(conn, rarity, price_usd)
+                        logger.info(f"Floor raised for {rarity}: {round(price_usd, 2):.2f} USD")
             await asyncio.sleep(10)
 
 

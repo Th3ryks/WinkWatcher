@@ -41,10 +41,10 @@ The bot sends a photo with HTML-formatted caption:
 
 ## Commands 🧭
 - `/current` — shows current thresholds per rarity:
-  - 🟨 Legendary -> 10%
-  - 🟪 Epic -> 20%
-  - 🟦 Rare -> 50%
-  - 🟩 Uncommon -> 50%
+  - 🟪 Legendary -> 10%
+  - 🟥 Epic -> 20%
+  - 🟨 Rare -> 50%
+  - 🟦 Uncommon -> 50%
   - ⬜️ Common -> 10%
 - `/set Rarity, Percent` — updates threshold for a rarity, percent range `1..100`
   - Example: `/set Common, 10`
