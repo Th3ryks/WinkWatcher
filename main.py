@@ -400,17 +400,24 @@ def _parse_price(price_str: Optional[str]) -> Optional[float]:
         return None
 
 async def get_eth_usdt_rate(session: aiohttp.ClientSession) -> Optional[float]:
-    try:
-        async with session.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "ETHUSDT"}, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                p = data.get("price")
-                if isinstance(p, str):
-                    return float(p)
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        logger.exception(f"Rate fetch error: {e}")
+    for attempt in range(3):
+        try:
+            async with session.get(
+                "https://api.binance.com/api/v3/ticker/price",
+                params={"symbol": "ETHUSDT"},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    p = data.get("price")
+                    if isinstance(p, str):
+                        return float(p)
+                logger.info(f"Rate non-200 {resp.status}")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.info("Rate fetch error")
+        await asyncio.sleep(1.0 * (attempt + 1))
     return None
 
 def _format_caption(token_id: Optional[str], rarity: Optional[str], price: Optional[str], floor_price: Optional[float], rarible_url: Optional[str], opensea_url: Optional[str]) -> str:
@@ -579,10 +586,14 @@ async def run() -> None:
 
         logger.info("Initializing floors and starting watcher")
         tick = 0
+        last_rate: Optional[float] = None
         while True:
             tick += 1
-            rate = await get_eth_usdt_rate(session)
-            if rate:
+            new_rate = await get_eth_usdt_rate(session)
+            if isinstance(new_rate, float):
+                last_rate = new_rate
+            rate = last_rate
+            if isinstance(rate, float):
                 logger.info(f"ETHUSDT rate: {rate:.2f}")
             else:
                 logger.info("ETHUSDT rate unavailable")
