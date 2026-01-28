@@ -44,41 +44,57 @@ def _build_headers() -> Dict[str, str]:
 async def fetch_json(
     session: aiohttp.ClientSession, url: str, params: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
-    for attempt in range(5):
+    max_attempts = 5
+    for attempt in range(max_attempts):
         try:
             async with session.get(url, params=params, headers=_build_headers()) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                logger.info(f"Non-200 response {resp.status} for {url}")
+                if attempt == max_attempts - 1:
+                    logger.info(f"Non-200 response {resp.status} for {url}")
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.info(f"Request error on attempt {attempt + 1} for {url}: {e}")
+            if attempt == max_attempts - 1:
+                logger.info(f"Request error for {url}: {e}")
         await asyncio.sleep(1.5 * (attempt + 1))
     return {}
 
 async def post_json(
     session: aiohttp.ClientSession, url: str, payload: Dict[str, Any]
 ) -> Any:
-    for attempt in range(5):
+    max_attempts = 5
+    for attempt in range(max_attempts):
         try:
             async with session.post(
                 url,
                 json=payload,
                 headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "Origin": "https://og.rarible.com",
-                    "Referer": "https://og.rarible.com/winkdiscover/items",
+                    "accept": "*/*",
+                    "accept-language": "en-US,en;q=0.9",
+                    "content-type": "application/json",
+                    "origin": "https://og.rarible.com",
+                    "priority": "u=1, i",
+                    "referer": "https://og.rarible.com/winkdiscover/items?filter[filter][statuses][]=FIXED_PRICE&filter[filter][nsfw]=true&filter[filter][blockchain]=POLYGON",
+                    "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"macOS"',
+                    "sec-fetch-dest": "empty",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-origin",
+                    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+                    "x-fingerprint": "e854e931f2eaadc94acbd29efe2f7983",
                 },
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                logger.info(f"Non-200 response {resp.status} for {url}")
+                if attempt == max_attempts - 1:
+                    logger.info(f"Non-200 response {resp.status} for {url}")
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.info(f"Request error on attempt {attempt + 1} for {url}: {e}")
+            if attempt == max_attempts - 1:
+                logger.info(f"Request error for {url}: {e}")
         await asyncio.sleep(1.5 * (attempt + 1))
     return {}
 
@@ -134,7 +150,14 @@ async def extract_price(item: Dict[str, Any]) -> Tuple[Optional[str], Optional[s
     ownership = item.get("ownership") or {}
     if not order and ownership:
         p = ownership.get("price")
-        symbol = None
+        symbol = "ETH"
+        currency_id = ownership.get("currencyId")
+        if isinstance(currency_id, str):
+            if "MATIC" in currency_id or "0x0000000000000000000000000000000000001010" in currency_id:
+                symbol = "MATIC"
+            elif "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619" in currency_id:
+                symbol = "WETH"
+        
         last = item.get("lastSellPrice") or {}
         currency = last.get("currency") or {}
         sym = currency.get("symbol")
@@ -272,17 +295,19 @@ async def search_items_marketplace(
     for _ in range(max_pages):
         payload: Dict[str, Any] = {
             "size": page_size,
-            "continuation": continuation,
             "filter": {
                 "verifiedOnly": False,
                 "sort": "LOW_PRICE_FIRST",
-                "collections": [collection],
-                "blockchains": ["ETHEREUM","MOONBEAM","ETHERLINK","POLYGON","BASE","RARI","ZKSYNC","APTOS","GOAT","SHAPE","TELOS","MATCH","ARBITRUM","ABSTRACT","HEDERAEVM","VICTION","ZKCANDY"],
-                "hideItemsSupply": "HIDE_LAZY_SUPPLY",
+                "statuses": ["FIXED_PRICE"],
+                "collections": [f"POLYGON-{collection}"],
+                "blockchains": ["POLYGON"],
                 "nsfw": True,
-                "hasMetaContentOnly": False,
+                "orderSources": [],
+                "hasMetaContentOnly": True,
             },
         }
+        if continuation:
+            payload["continuation"] = continuation
         data = await post_json(session, url, payload)
         if isinstance(data, list):
             new_items = data
@@ -300,16 +325,17 @@ async def search_cheapest_by_rarity(
 ) -> List[Dict[str, Any]]:
     url = f"{base}/items/search"
     payload: Dict[str, Any] = {
-        "size": 1,
+        "size": 30,
         "filter": {
             "verifiedOnly": False,
             "sort": "LOW_PRICE_FIRST",
-            "collections": [collection],
-            "blockchains": ["ETHEREUM","MOONBEAM","ETHERLINK","POLYGON","BASE","RARI","ZKSYNC","APTOS","GOAT","SHAPE","TELOS","MATCH","ARBITRUM","ABSTRACT","HEDERAEVM","VICTION","ZKCANDY"],
-            "hideItemsSupply": "HIDE_LAZY_SUPPLY",
-            "nsfw": True,
-            "hasMetaContentOnly": False,
+            "statuses": ["FIXED_PRICE"],
+            "collections": [f"POLYGON-{collection}"],
             "traits": [{"key": "Rarity", "values": [rarity]}],
+            "blockchains": ["POLYGON"],
+            "nsfw": True,
+            "orderSources": [],
+            "hasMetaContentOnly": True,
         },
     }
     data = await post_json(session, url, payload)
@@ -412,12 +438,26 @@ async def get_eth_usdt_rate(session: aiohttp.ClientSession) -> Optional[float]:
                     p = data.get("price")
                     if isinstance(p, str):
                         return float(p)
-                logger.info(f"Rate non-200 {resp.status}")
+                # fall through to retry
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.info("Rate fetch error")
+            pass
         await asyncio.sleep(1.0 * (attempt + 1))
+    try:
+        async with session.get(
+            "https://api.coinbase.com/v2/prices/ETH-USD/spot",
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                amt = ((data.get("data") or {}).get("amount"))
+                if isinstance(amt, str):
+                    return float(amt)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
     return None
 
 def _format_caption(token_id: Optional[str], rarity: Optional[str], price: Optional[str], floor_price: Optional[float], rarible_url: Optional[str], opensea_url: Optional[str]) -> str:
@@ -441,7 +481,7 @@ def _format_caption(token_id: Optional[str], rarity: Optional[str], price: Optio
 
 
 async def run() -> None:
-    collection_hyphen = "POLYGON-0xd8156606d2bf60c12d55f561395d29ba3c5ccc63"
+    collection_hyphen = "0xd8156606d2bf60c12d55f561395d29ba3c5ccc63"
 
     load_dotenv()
     marketplace_base = "https://og.rarible.com/marketplace/api/v4"
@@ -455,7 +495,7 @@ async def run() -> None:
         channel_id_int = None
 
     timeout = aiohttp.ClientTimeout(total=30)
-    connector = aiohttp.TCPConnector(limit=16, enable_cleanup_closed=True)
+    connector = aiohttp.TCPConnector(limit=16, enable_cleanup_closed=True, use_dns_cache=True, ttl_dns_cache=300)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         bot: Optional[Bot] = None
         if bot_token:
@@ -563,14 +603,26 @@ async def run() -> None:
             preview_url = extract_preview_url(it, meta_extracted) or image_url
             price, currency = await extract_price(it)
             token_id = it.get("tokenId")
+            if not token_id:
+                token_id = it.get("ownership", {}).get("tokenId")
             item_id = it.get("id")
             rarible_url = f"https://og.rarible.com/token/{item_id}" if isinstance(item_id, str) else None
-            opensea_url = f"https://opensea.io/item/pol/{collection_hyphen}/{token_id}" if isinstance(token_id, str) else None
+            opensea_url = f"https://opensea.io/item/polygon/{collection_hyphen}/{token_id}" if isinstance(token_id, str) else None
             rarity = extract_rarity(it, meta_extracted.get("rarity"))
             price_val = _parse_price(price)
             price_usd: Optional[float] = None
-            if rate is not None and price_val is not None:
-                price_usd = price_val * rate
+            
+            price_eth = it.get("ownership", {}).get("priceEth")
+            if price_eth is not None:
+                try:
+                     price_val_for_usd = float(price_eth)
+                except Exception:
+                     price_val_for_usd = price_val
+            else:
+                price_val_for_usd = price_val
+
+            if rate is not None and price_val_for_usd is not None:
+                price_usd = price_val_for_usd * rate
             return {
                 "image_url": image_url,
                 "preview_url": preview_url,
